@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 
 @dataclass
@@ -20,5 +20,5 @@ class ExperimentConfig:
     shots: int = 10_000
     seed: int = 42
     noise: Optional[List[NoiseSpec]] = None
-    measurement: MeasurementSpec = MeasurementSpec(kind="projective")
+    measurement: MeasurementSpec = field(default_factory=lambda: MeasurementSpec(kind="projective"))
     meta: Optional[Dict[str, Any]] = None

@@ -1,96 +1,21 @@
-# experiments/bell_readout_calibration.py
 import json
+import sys
 from pathlib import Path
 import numpy as np
+
+# Add parent directory to path to find qmeasure package
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 OUT_DIR = Path("outputs/bell_readout_calibration")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ----------------------------
-# Optional: use qmeasure if implemented
-# ----------------------------
-USE_QMEASURE = True
-try:
-    from qmeasure.config import ExperimentConfig, NoiseSpec, MeasurementSpec
-    from qmeasure.simulate import simulate_density
-    from qmeasure.calibrate import fit_readout_error_1q
-    from qmeasure.metrics import total_variation_distance
-except Exception:
-    USE_QMEASURE = False
+from qmeasure.config import ExperimentConfig, MeasurementSpec
+from qmeasure.simulate import simulate_density
+from qmeasure.measure import apply_readout_error
 
 # ----------------------------
-# Minimal fallback simulator for 2-qubit Bell + readout calibration
+# Readout error fitting utilities
 # ----------------------------
-def _H():
-    return (1 / np.sqrt(2)) * np.array([[1, 1], [1, -1]], dtype=np.complex128)
-
-def _I():
-    return np.eye(2, dtype=np.complex128)
-
-def _CNOT_2q():
-    # control=0, target=1, basis |00|01|10|11
-    return np.array(
-        [
-            [1, 0, 0, 0],
-            [0, 1, 0, 0],
-            [0, 0, 0, 1],
-            [0, 0, 1, 0],
-        ],
-        dtype=np.complex128,
-    )
-
-def _kron(*mats):
-    out = mats[0]
-    for m in mats[1:]:
-        out = np.kron(out, m)
-    return out
-
-def _ket0(n):
-    v = np.zeros((2**n,), dtype=np.complex128)
-    v[0] = 1.0 + 0j
-    return v
-
-def _rho_from_ket(ket):
-    return np.outer(ket, ket.conj())
-
-def _apply_unitary_rho(rho, U):
-    return U @ rho @ U.conj().T
-
-def _measure_comp_basis_from_rho(rho, shots, seed=42):
-    # probs are diagonal elements in computational basis
-    probs = np.real(np.diag(rho)).clip(0, 1)
-    probs = probs / probs.sum()
-    rng = np.random.default_rng(seed)
-    idx = rng.choice(len(probs), size=shots, p=probs)
-    hist = {}
-    n = int(np.log2(len(probs)))
-    for i in idx:
-        b = format(i, f"0{n}b")
-        hist[b] = hist.get(b, 0) + 1
-    return hist, probs
-
-def _apply_readout_error_indep(hist, p01, p10, seed=123):
-    # independent per bit: 0->1 with p01, 1->0 with p10
-    rng = np.random.default_rng(seed)
-    out = {}
-    for bitstr, c in hist.items():
-        for _ in range(c):
-            bits = list(bitstr)
-            for j, bj in enumerate(bits):
-                r = rng.random()
-                if bj == "0" and r < p01:
-                    bits[j] = "1"
-                elif bj == "1" and r < p10:
-                    bits[j] = "0"
-            bs2 = "".join(bits)
-            out[bs2] = out.get(bs2, 0) + 1
-    return out
-
-def _hist_to_probs(hist):
-    keys = sorted(hist.keys())
-    total = sum(hist.values())
-    return {k: v / total for k, v in hist.items()}
-
 def _tvd(p_dict, q_dict):
     # total variation distance over union support
     keys = set(p_dict) | set(q_dict)
@@ -152,22 +77,51 @@ def main():
     true_p01 = 0.06
     true_p10 = 0.03
 
-    if USE_QMEASURE:
-        # If your qmeasure is implemented, plug it here.
-        # But since your skeleton may be incomplete, the fallback is what will run.
-        print("qmeasure detected, but this script will likely fail unless qmeasure is fully implemented.")
-        print("Falling back to internal implementation for guaranteed output.\n")
+    # --- Circuit: Bell state via unitaries ---
+    def _H():
+        return (1 / np.sqrt(2)) * np.array([[1, 1], [1, -1]], dtype=np.complex128)
 
-    # Build Bell state |Φ+> = (|00> + |11>)/sqrt(2)
-    ket = _ket0(2)
-    U1 = _kron(_H(), _I())         # H on qubit 0
-    U2 = _CNOT_2q()                # CNOT control 0 target 1
-    ket = (U2 @ (U1 @ ket))
-    rho = _rho_from_ket(ket)
+    def _I():
+        return np.eye(2, dtype=np.complex128)
 
-    ideal_hist, ideal_probs = _measure_comp_basis_from_rho(rho, shots=shots, seed=seed)
-    noisy_hist = _apply_readout_error_indep(ideal_hist, p01=true_p01, p10=true_p10, seed=seed + 1)
+    def _CNOT_2q():
+        return np.array(
+            [[1,0,0,0],
+             [0,1,0,0],
+             [0,0,0,1],
+             [0,0,1,0]],
+            dtype=np.complex128
+        )
 
+    def _kron(*mats):
+        out = mats[0]
+        for m in mats[1:]:
+            out = np.kron(out, m)
+        return out
+
+    def bell_circuit(n_qubits: int):
+        assert n_qubits == 2
+        U1 = _kron(_H(), _I())   # H on qubit 0
+        U2 = _CNOT_2q()          # CNOT 0->1
+        return [U1, U2]
+
+    cfg = ExperimentConfig(
+        name="bell_readout_calibration",
+        n_qubits=2,
+        shots=shots,
+        seed=seed,
+        noise=None,
+        measurement=MeasurementSpec(kind="projective"),
+    )
+
+    out = simulate_density(cfg, circuit_fn=bell_circuit)
+    ideal_hist = out["histogram"]
+
+    # inject readout error (ground-truth)
+    noisy_hist = apply_readout_error(ideal_hist, p01=true_p01, p10=true_p10, seed=seed + 1)
+
+    # Fit p01/p10 from observed histogram using the same grid-search logic (inline)
+    # (Keep the same fitter you already wrote, but rename it locally if you want.)
     fit = _fit_readout_error_from_bell(noisy_hist, shots=shots)
 
     payload = {
@@ -192,7 +146,7 @@ def main():
 ## Histograms
 - reedout-noisy: {noisy_hist}
 """
-    (OUT_DIR / "report.md").write_text(report)
+    (OUT_DIR / "report.md").write_text(report, encoding='utf-8')
 
     print("✅ Done.")
     print(f"Saved: {OUT_DIR / 'results.json'}")
